@@ -4,7 +4,7 @@ import fs from 'node:fs/promises';
 import {existsSync} from 'node:fs';
 import path from 'node:path';
 import {fileURLToPath} from 'node:url';
-import {spawnSync} from 'node:child_process';
+import {spawn, spawnSync} from 'node:child_process';
 import {randomUUID} from 'node:crypto';
 import {
   atomicWrite,
@@ -17,7 +17,7 @@ import {
   takeOption,
 } from '../src/client-core.mjs';
 
-const VERSION = '0.1.0';
+const VERSION = '0.1.1';
 const HELP = `TunnelTerm ${VERSION}
 
 Use an authenticated VS Code Remote Tunnel like a local terminal.
@@ -30,7 +30,7 @@ Usage:
   tunnelterm get  [-t TARGET] REMOTE_PATH LOCAL_PATH
   tunnelterm put  [-t TARGET] LOCAL_PATH REMOTE_PATH
   tunnelterm open TUNNEL REMOTE_PATH [--code PATH] [--dev]
-  tunnelterm doctor
+  tunnelterm doctor [--code PATH]
 
 TARGET is a tunnel name, an instance id, or a unique workspace-path substring
 from 'tunnelterm list'. If exactly one bridge is active, -t is optional. In an
@@ -281,11 +281,42 @@ async function openCommand(args) {
   // bare `code` command commonly resolves to code.cmd and therefore needs the
   // command processor.
   const needsWindowsShell = process.platform === 'win32' && !/\.exe$/i.test(codePath);
-  const result = spawnSync(codePath, commandArgs, {stdio: 'inherit', shell: needsWindowsShell});
-  if (result.error) throw result.error;
-  if (result.status) throw new Error(`VS Code exited with status ${result.status}`);
+  // Code.exe may become the long-lived GUI process when no instance is running.
+  // Wait for bridge readiness below, not for that GUI process to exit.
+  const launchState = {failure: undefined};
+  try {
+    await new Promise((resolve, reject) => {
+      const child = spawn(codePath, commandArgs, {
+        stdio: 'ignore', shell: needsWindowsShell, detached: true, windowsHide: true,
+      });
+      let started = false;
+      child.once('error', error => {
+        launchState.failure = error;
+        if (!started) reject(error);
+      });
+      child.once('exit', (code, signal) => {
+        if (code !== 0) {
+          launchState.failure = new Error(signal
+            ? `VS Code terminated by signal ${signal}`
+            : `VS Code exited with status ${code}`);
+        }
+      });
+      child.once('spawn', () => {
+        started = true;
+        child.unref();
+        resolve();
+      });
+    });
+  } catch (error) {
+    await fs.unlink(openRequest).catch(() => {});
+    throw error;
+  }
   const deadline = Date.now() + 15_000;
   while (Date.now() < deadline) {
+    if (launchState.failure) {
+      await fs.unlink(openRequest).catch(() => {});
+      throw launchState.failure;
+    }
     const matching = (await listInstances()).some(instance =>
       instance.active && instance.tunnel === tunnel && instance.defaultCwd === remotePath);
     if (matching) {
@@ -298,21 +329,33 @@ async function openCommand(args) {
   console.error('VS Code opened. Complete any sign-in or Workspace Trust prompt, then run tunnelterm list.');
 }
 
-async function doctorCommand() {
+async function doctorCommand(args) {
+  const requestedCodePath = takeOption(args, '--code', '-c') || 'code';
+  if (args.length) throw new Error(`Unexpected doctor arguments: ${args.join(' ')}`);
   console.log(`TunnelTerm ${VERSION}`);
   console.log(`Node ${process.version} (${process.platform} ${process.arch})`);
-  const codeExecutable = resolveCodeExecutable('code');
-  const code = spawnSync(codeExecutable, ['--version'], {
-    encoding: 'utf8',
-    shell: process.platform === 'win32' && !/\.exe$/i.test(codeExecutable),
-  });
+  const codeExecutable = resolveCodeExecutable(requestedCodePath);
+  const codeCmd = path.join(path.dirname(codeExecutable), 'bin', 'code.cmd');
+  // The Windows GUI executable does not implement the CLI --version route.
+  // Its bundled code.cmd sets ELECTRON_RUN_AS_NODE and invokes the CLI entry.
+  const code = process.platform === 'win32' && /\.exe$/i.test(codeExecutable) && existsSync(codeCmd)
+    ? spawnSync(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', `""${codeCmd}" --version"`], {
+      encoding: 'utf8', windowsVerbatimArguments: true, windowsHide: true, timeout: 10_000,
+    })
+    : spawnSync(codeExecutable, ['--version'], {
+      encoding: 'utf8', timeout: 10_000, windowsHide: true,
+      shell: process.platform === 'win32' && !/\.exe$/i.test(codeExecutable),
+    });
   if (code.status === 0) {
     const reportedVersion = code.stdout.trim().split(/\r?\n/)[0];
     console.log(reportedVersion
       ? `VS Code CLI ${reportedVersion} (${codeExecutable})`
       : `VS Code executable found (${codeExecutable})`);
   }
-  else console.log('VS Code CLI: not found on PATH (use tunnelterm open --code PATH)');
+  else if (code.error?.code === 'ETIMEDOUT') {
+    console.log(`VS Code CLI: version probe timed out after 10 seconds (${codeExecutable})`);
+  }
+  else console.log('VS Code CLI: not found (use tunnelterm doctor --code PATH)');
   const instances = await listInstances();
   console.log(`Bridge instances: ${instances.length}, active: ${instances.filter(item => item.active).length}`);
   for (const item of instances.filter(value => value.active)) {
@@ -343,7 +386,7 @@ async function main() {
     case 'get': await getCommand(args); break;
     case 'put': await putCommand(args); break;
     case 'open': await openCommand(args); break;
-    case 'doctor': await doctorCommand(); break;
+    case 'doctor': await doctorCommand(args); break;
     default: throw new Error(`Unknown command: ${command}\n\n${HELP}`);
   }
 }

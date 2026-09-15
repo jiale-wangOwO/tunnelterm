@@ -43,7 +43,7 @@ cd tunnelterm
 npm install
 npm link
 npm run package:vsix
-code --install-extension .\tunnelterm-vscode-0.1.0.vsix
+code --install-extension .\tunnelterm-vscode-0.1.1.vsix
 ```
 
 连接一个 Tunnel 工作区（下面的名称和路径替换成你自己的）：
@@ -88,7 +88,7 @@ tunnelterm exec [-t TARGET] [--cwd REMOTE_PATH] [--timeout SECONDS] [--] COMMAND
 tunnelterm get  [-t TARGET] REMOTE_PATH LOCAL_PATH
 tunnelterm put  [-t TARGET] LOCAL_PATH REMOTE_PATH
 tunnelterm open TUNNEL REMOTE_PATH [--code PATH] [--dev]
-tunnelterm doctor
+tunnelterm doctor [--code PATH]
 ```
 
 Examples:

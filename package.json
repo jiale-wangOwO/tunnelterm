@@ -2,7 +2,7 @@
   "name": "tunnelterm-vscode",
   "displayName": "TunnelTerm",
   "description": "Use an authenticated VS Code Remote Tunnel as an interactive local terminal.",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "publisher": "tunnelterm",
   "license": "MIT",
   "private": false,
