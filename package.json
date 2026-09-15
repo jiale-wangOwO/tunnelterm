@@ -1,0 +1,113 @@
+{
+  "name": "tunnelterm-vscode",
+  "displayName": "TunnelTerm",
+  "description": "Use an authenticated VS Code Remote Tunnel as an interactive local terminal.",
+  "version": "0.1.0",
+  "publisher": "tunnelterm",
+  "license": "MIT",
+  "private": false,
+  "type": "module",
+  "engines": {
+    "node": ">=20",
+    "vscode": "^1.95.0"
+  },
+  "extensionKind": [
+    "ui"
+  ],
+  "activationEvents": [
+    "onStartupFinished",
+    "onCommand:tunnelterm.showStatus"
+  ],
+  "main": "./src/extension.cjs",
+  "bin": {
+    "tunnelterm": "./bin/tunnelterm.mjs"
+  },
+  "files": [
+    "bin/tunnelterm.mjs",
+    "src/client-core.mjs",
+    "src/extension.cjs",
+    "remote/tunnelterm_agent.py",
+    "docs/architecture.md",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md",
+    "SECURITY.md",
+    "CONTRIBUTING.md"
+  ],
+  "contributes": {
+    "commands": [
+      {
+        "command": "tunnelterm.showStatus",
+        "title": "TunnelTerm: Show Bridge Status"
+      }
+    ],
+    "configuration": {
+      "title": "TunnelTerm",
+      "properties": {
+        "tunnelterm.allowedRoots": {
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": [],
+          "description": "Remote POSIX paths TunnelTerm may use for working directories and file transfer. Empty means the currently opened remote workspace folders."
+        },
+        "tunnelterm.defaultCwd": {
+          "type": "string",
+          "default": "",
+          "description": "Default remote working directory. Empty means the first remote workspace folder."
+        },
+        "tunnelterm.shell": {
+          "type": "string",
+          "default": "",
+          "description": "Remote POSIX shell command, for example /bin/bash. Empty uses the remote SHELL environment variable, then /bin/sh."
+        },
+        "tunnelterm.maxTransferBytes": {
+          "type": "integer",
+          "default": 67108864,
+          "minimum": 1048576,
+          "maximum": 536870912,
+          "description": "Maximum size of one uploaded/downloaded file and one captured stdout/stderr stream."
+        },
+        "tunnelterm.requestPollMs": {
+          "type": "integer",
+          "default": 30,
+          "minimum": 10,
+          "maximum": 1000,
+          "description": "Local request queue polling interval in milliseconds."
+        }
+      }
+    }
+  },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false,
+      "description": "TunnelTerm can execute remote commands and is disabled until the workspace is trusted."
+    },
+    "virtualWorkspaces": false
+  },
+  "scripts": {
+    "check": "node --check bin/tunnelterm.mjs && node --check src/extension.cjs && python -m py_compile remote/tunnelterm_agent.py",
+    "test": "node --test",
+    "package:vsix": "npx @vscode/vsce package --allow-missing-repository",
+    "prepublishOnly": "npm run check && npm test"
+  },
+  "devDependencies": {
+    "@vscode/vsce": "^3.6.2"
+  },
+  "keywords": [
+    "vscode",
+    "remote-tunnel",
+    "terminal",
+    "pty",
+    "shell"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jiale-wangOwO/tunnelterm.git"
+  },
+  "bugs": {
+    "url": "https://github.com/jiale-wangOwO/tunnelterm/issues"
+  },
+  "homepage": "https://github.com/jiale-wangOwO/tunnelterm#readme"
+}
