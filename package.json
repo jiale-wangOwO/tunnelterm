@@ -125,7 +125,7 @@
     "prepublishOnly": "npm run check && npm test"
   },
   "devDependencies": {
-    "@vscode/vsce": "^3.6.2"
+    "@vscode/vsce": "^4.0.0"
   },
   "keywords": [
     "vscode",
