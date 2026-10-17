@@ -2,7 +2,7 @@
   "name": "tunnelterm-vscode",
   "displayName": "TunnelTerm",
   "description": "Use an authenticated VS Code Remote Tunnel as an interactive local terminal.",
-  "version": "0.1.1",
+  "version": "0.1.3",
   "publisher": "tunnelterm",
   "license": "MIT",
   "private": false,
@@ -20,14 +20,44 @@
   ],
   "main": "./src/extension.cjs",
   "bin": {
-    "tunnelterm": "./bin/tunnelterm.mjs"
+    "tunnelterm": "./bin/tunnelterm.mjs",
+    "tunnelterm-mcp": "./bin/tunnelterm-mcp.mjs"
   },
   "files": [
     "bin/tunnelterm.mjs",
+    "bin/tunnelterm-mcp.mjs",
+    "src/mcp-server.mjs",
     "src/client-core.mjs",
+    "src/ssh-stream.mjs",
+    "src/devtunnel-client.mjs",
+    "src/managed-service.mjs",
+    "src/service-cli.mjs",
+    "src/forked-worker.mjs",
+    "src/service-worker.mjs",
+    "src/stream-errors.mjs",
     "src/extension.cjs",
+    "src/bridge-health.cjs",
     "remote/tunnelterm_agent.py",
     "docs/architecture.md",
+    "docs/codex.md",
+    "docs/ssh-stream.md",
+    "docs/managed-service.md",
+    "docs/recovery.zh-CN.md",
+    "scripts/service.ps1",
+    "scripts/mcp-smoke.mjs",
+    "scripts/diagnose-provider.mjs",
+    "scripts/probe-cli-context.mjs",
+    "scripts/probe-cli-context.ps1",
+    "scripts/probe-cli-metadata.mjs",
+    "scripts/start-ssh-forward.ps1",
+    "scripts/verify-ssh-stream.mjs",
+    "scripts/probe-ssh-disconnect.mjs",
+    "scripts/verify-ssh-query-recovery.mjs",
+    "scripts/create-service-workspace.mjs",
+    "scripts/run-managed-service.ps1",
+    "scripts/install-service-autostart.ps1",
+    "scripts/migrate-service-state.mjs",
+    "tools/install-devtunnel.ps1",
     "README.md",
     "LICENSE",
     "CHANGELOG.md",
@@ -87,8 +117,10 @@
     "virtualWorkspaces": false
   },
   "scripts": {
-    "check": "node --check bin/tunnelterm.mjs && node --check src/extension.cjs && python -m py_compile remote/tunnelterm_agent.py",
+    "check": "node scripts/check.mjs",
     "test": "node --test",
+    "test:mcp": "node scripts/mcp-smoke.mjs",
+    "package:stream": "node scripts/package-stream.mjs",
     "package:vsix": "npx @vscode/vsce package --allow-missing-repository",
     "prepublishOnly": "npm run check && npm test"
   },
@@ -109,5 +141,10 @@
   "bugs": {
     "url": "https://github.com/jiale-wangOwO/tunnelterm/issues"
   },
-  "homepage": "https://github.com/jiale-wangOwO/tunnelterm#readme"
+  "homepage": "https://github.com/jiale-wangOwO/tunnelterm#readme",
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.32.0",
+    "ws": "^8.22.0",
+    "zod": "^4.6.5"
+  }
 }

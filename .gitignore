@@ -1,7 +1,18 @@
 node_modules/
 *.vsix
+*.tgz
 *.log
 __pycache__/
 *.py[cod]
 .DS_Store
 Thumbs.db
+.env
+.env.*
+!.env.example
+.tunnelterm/
+*.runtime.json
+*.route.json
+*.maintenance.lock
+
+# Local legacy SSH compatibility adapter; not part of the public tool.
+/tools/ssh.cmd

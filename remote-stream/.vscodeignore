@@ -1,0 +1,7 @@
+package-lock.json
+node_modules/.package-lock.json
+node_modules/.bin/**
+node_modules/ws/README.md
+node_modules/ws/browser.js
+node_modules/ws/wrapper.mjs
+*.vsix

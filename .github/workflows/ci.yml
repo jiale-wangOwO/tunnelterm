@@ -26,3 +26,24 @@ jobs:
       - run: npm ci
       - run: npm run check
       - run: npm test
+      - run: npm run test:mcp
+
+  package:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: npm
+      - run: npm ci
+      - run: npm ci --prefix remote-stream
+      - run: npm run package:vsix
+      - run: npm run package:stream
+      - uses: actions/upload-artifact@v7
+        with:
+          name: tunnelterm-vsix
+          path: |
+            tunnelterm-vscode-*.vsix
+            remote-stream/tunnelterm-stream-*.vsix
+          if-no-files-found: error

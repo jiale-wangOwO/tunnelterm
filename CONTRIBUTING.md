@@ -3,9 +3,13 @@
 Run the automated checks before submitting a change:
 
 ```powershell
-npm install
+npm ci
+npm ci --prefix remote-stream
 npm run check
 npm test
+npm run test:mcp
+npm run package:vsix
+npm run package:stream
 ```
 
 For an end-to-end development run:
@@ -32,3 +36,9 @@ Verify these behaviors manually:
 
 Do not include tunnel names, usernames, private remote paths, tokens, or other
 credentials in tests, logs, screenshots, issues, or commits.
+
+Tests use temporary local fixtures and mock providers; the default suite must
+not depend on a personal tunnel, scheduled task or cloud login. CI covers
+Windows/macOS/Linux on Node.js 20 and 22 and separately builds both VSIX files.
+Real SSH checks in `docs/managed-service.md` are opt-in: use owned test PTYs,
+preserve existing work and report their results separately from local tests.

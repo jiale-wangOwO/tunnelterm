@@ -1,0 +1,48 @@
+{
+  "name": "tunnelterm-stream",
+  "publisher": "tunnelterm",
+  "displayName": "TunnelTerm SSH Stream",
+  "description": "Native streaming SSH companion for TunnelTerm over VS Code Remote Tunnels.",
+  "version": "0.1.3",
+  "license": "MIT",
+  "engines": {
+    "vscode": "^1.95.0"
+  },
+  "extensionKind": [
+    "workspace"
+  ],
+  "activationEvents": [
+    "onCommand:tunnelterm.streamEndpoint"
+  ],
+  "main": "./extension.cjs",
+  "contributes": {
+    "configuration": {
+      "title": "TunnelTerm SSH Stream",
+      "properties": {
+        "tunneltermStream.bootstrapPort": {
+          "type": "integer",
+          "default": 0,
+          "scope": "resource",
+          "anyOf": [
+            {"enum": [0]},
+            {"minimum": 1024, "maximum": 65535}
+          ],
+          "markdownDescription": "Optional listening port for this workspace's first SSH Stream broker startup. Use `0` to allocate a port, or `1024`–`65535` to reuse an explicitly verified existing port mapping. Once a broker port is saved, the saved port takes precedence and this setting does not migrate it. In a multi-folder workspace, the first folder's setting is used. An occupied port fails without taking over the listener or allocating a fallback port."
+        }
+      }
+    }
+  },
+  "capabilities": {
+    "untrustedWorkspaces": {
+      "supported": false
+    },
+    "virtualWorkspaces": false
+  },
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/jiale-wangOwO/tunnelterm.git"
+  },
+  "dependencies": {
+    "ws": "^8.18.3"
+  }
+}

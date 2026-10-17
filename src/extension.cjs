@@ -7,6 +7,9 @@ const fs = require('node:fs/promises');
 const path = require('node:path');
 const os = require('node:os');
 const crypto = require('node:crypto');
+const {createRemoteHealthProbe, streamEndpointError, publicStreamEndpointFailure} = require('./bridge-health.cjs');
+const BUILD_SHA256 = crypto.createHash('sha256').update(require('node:fs').readFileSync(__filename)).digest('hex');
+const RUNTIME_GENERATION = crypto.randomUUID();
 
 const PROTOCOL_VERSION = 1;
 const SOURCE = 'TunnelTerm';
@@ -20,12 +23,24 @@ function localStateRoot() {
   return path.join(os.homedir(), '.local', 'state', 'tunnelterm');
 }
 
-async function atomicLocal(file, value, mode = 0o600) {
+async function atomicLocal(file, value, mode = 0o600, renameRetries = 0) {
   await fs.mkdir(path.dirname(file), {recursive: true, mode: 0o700});
   const temporary = `${file}.tmp-${crypto.randomUUID()}`;
   const data = Buffer.isBuffer(value) ? value : Buffer.from(JSON.stringify(value, null, 2));
   await fs.writeFile(temporary, data, {mode});
-  await fs.rename(temporary, file);
+  try {
+    for (let attempt = 0; ; attempt++) {
+      try {await fs.rename(temporary, file); break;}
+      catch (error) {
+        if (attempt >= renameRetries || !['EPERM', 'EACCES', 'EBUSY'].includes(error.code)) throw error;
+        await delay(50);
+      }
+    }
+  } finally {
+    // This extension created the unique temporary file; never remove the old
+    // published status merely to work around a Windows reader's sharing lock.
+    await fs.unlink(temporary).catch(() => {});
+  }
 }
 
 function normalizeRemotePath(value) {
@@ -215,14 +230,31 @@ async function activate(context) {
   const remoteBase = `/tmp/tunnelterm-${instanceKey}-${token.slice(0, 12)}`;
   const helperPath = `${remoteBase}/tunnelterm_agent.py`;
   const activeSessions = new Map();
+  const activeTcpRelays = new Map();
   const inFlightRequests = new Set();
+  let streamEndpointLookup;
   let stopped = false;
   let processing = false;
+  const remoteHealth = createRemoteHealthProbe({
+    probe: () => vscode.workspace.fs.stat(folder.uri),
+    isTrusted: () => vscode.workspace.isTrusted,
+    isStopped: () => stopped,
+  });
+  let localQueueFailed = false;
+  let publication;
 
-  async function statusValue(ready = true, error = undefined) {
+  async function statusValue() {
+    const health = remoteHealth.snapshot();
+    if (localQueueFailed && health.bridge_alive && vscode.workspace.isTrusted) {
+      Object.assign(health, {ready: false, health_code: 'BRIDGE_IO_FAILED', next_action: 'inspect_bridge'});
+    }
     return {
       protocol: PROTOCOL_VERSION,
-      ready,
+      extensionVersion: context.extension.packageJSON.version,
+      sourceSha256: BUILD_SHA256,
+      runtimeGeneration: RUNTIME_GENERATION,
+      capabilities: {ssh_stream: 1, tcp_packets: 1},
+      ...health,
       trusted: vscode.workspace.isTrusted,
       instance: instanceKey,
       tunnel: friendlyTunnelName(folder.uri.authority),
@@ -235,16 +267,48 @@ async function activate(context) {
       pid: process.pid,
       platform: process.platform,
       updated: new Date().toISOString(),
-      error,
     };
   }
 
-  async function publishStatus(ready = true, error = undefined) {
-    await atomicLocal(statusFile, await statusValue(ready, error));
+  function publishStatus() {
+    if (publication) {
+      publication.again = true;
+      return publication.promise;
+    }
+    const current = {again: true};
+    publication = current;
+    current.promise = Promise.resolve().then(async () => {
+      do {
+        current.again = false;
+        await atomicLocal(statusFile, await statusValue(), 0o600, 3);
+      } while (current.again);
+    }).finally(() => {
+      if (publication === current) publication = undefined;
+      // A request can arrive between the final loop test and this microtask.
+      if (current.again) void publishStatus().catch(() => {});
+    });
+    return current.promise;
   }
 
-  await publishStatus(vscode.workspace.isTrusted, vscode.workspace.isTrusted ? undefined : 'Workspace is not trusted');
-  if (!vscode.workspace.isTrusted) return;
+  let queueTimer, heartbeatTimer, heartbeatWork;
+  context.subscriptions.push({
+    dispose() {
+      if (stopped) return;
+      stopped = true;
+      remoteHealth.stop();
+      clearInterval(queueTimer);
+      clearInterval(heartbeatTimer);
+      for (const {execution} of activeSessions.values()) execution.terminate();
+      for (const {execution} of activeTcpRelays.values()) execution.terminate();
+      return publishStatus().catch(() => {});
+    },
+  });
+
+  await publishStatus();
+  if (stopped || !vscode.workspace.isTrusted) return;
+  await remoteHealth.check();
+  await publishStatus();
+  if (stopped) return;
 
   async function ensureHelper() {
     const helper = await fs.readFile(path.join(context.extensionPath, 'remote', 'tunnelterm_agent.py'));
@@ -431,13 +495,113 @@ async function activate(context) {
     return {closed: true};
   }
 
+  async function startTcpRelay(request) {
+    if (request.host !== '127.0.0.1' || Number(request.port) !== 22) {
+      throw new Error('TunnelTerm TCP relay only permits 127.0.0.1:22');
+    }
+    const id = crypto.randomUUID();
+    const session = `${remoteBase}/tcp/${id}`;
+    await ensureHelper();
+    await vscode.workspace.fs.createDirectory(remoteUri(folder, `${session}/in`));
+    await vscode.workspace.fs.createDirectory(remoteUri(folder, `${session}/out`));
+    const task = taskFor(
+      folder,
+      id,
+      `TunnelTerm SSH relay ${id}`,
+      '/usr/bin/env',
+      ['python3', helperPath, 'tcp', session, '--host', '127.0.0.1', '--port', '22'],
+      defaultCwd,
+    );
+    const execution = await vscode.tasks.executeTask(task);
+    activeTcpRelays.set(id, {execution, session, inputSequence: 0});
+    const deadline = Date.now() + 15_000;
+    let state = null;
+    while (Date.now() < deadline) {
+      state = await readRemoteJson(folder, `${session}/state.json`, null);
+      if (state) break;
+      await delay(100);
+    }
+    if (!state || state.state !== 'running') {
+      execution.terminate();
+      activeTcpRelays.delete(id);
+      throw new Error(state?.error || 'Remote SSH relay did not start');
+    }
+    return {relay_id: id, state};
+  }
+
+  function requireTcpRelay(request) {
+    const relay = activeTcpRelays.get(request.relay_id);
+    if (!relay) throw new Error('Unknown or expired TCP relay');
+    return relay;
+  }
+
+  async function tcpInput(request) {
+    const relay = requireTcpRelay(request);
+    if (typeof request.data_base64 !== 'string') throw new Error('Missing TCP input data');
+    const data = Buffer.from(request.data_base64, 'base64');
+    if (!data.length || data.length > 64 * 1024) throw new Error('One TCP input packet must be 1..65536 bytes');
+    const sequence = relay.inputSequence++;
+    const inputPath = `${relay.session}/in/${String(sequence).padStart(16, '0')}.bin`;
+    await remoteAtomic(folder, inputPath, data);
+    const deadline = Date.now() + 15_000;
+    while (Date.now() < deadline) {
+      const ack = await readRemoteJson(folder, `${relay.session}/input_ack.json`, {});
+      if (Number(ack.sequence) >= sequence) {
+        await vscode.workspace.fs.delete(remoteUri(folder, inputPath), {useTrash: false}).catch(() => {});
+        return {accepted: data.length};
+      }
+      await delay(10);
+    }
+    throw new Error('Remote SSH relay did not acknowledge input');
+  }
+
+  async function tcpPoll(request) {
+    const relay = requireTcpRelay(request);
+    const entries = await vscode.workspace.fs.readDirectory(remoteUri(folder, `${relay.session}/out`));
+    const names = entries
+      .filter(([name, type]) => type === vscode.FileType.File && /^\d{16}\.bin$/.test(name))
+      .map(([name]) => name)
+      .sort();
+    const buffers = [];
+    let total = 0;
+    let lastSequence = -1;
+    for (const name of names) {
+      if (total >= 1024 * 1024) break;
+      const itemPath = `${relay.session}/out/${name}`;
+      const data = Buffer.from(await vscode.workspace.fs.readFile(remoteUri(folder, itemPath)));
+      buffers.push(data);
+      total += data.length;
+      await vscode.workspace.fs.delete(remoteUri(folder, itemPath), {useTrash: false});
+      lastSequence = Number(name.slice(0, 16));
+    }
+    if (lastSequence >= 0) {
+      await remoteAtomic(folder, `${relay.session}/ack.json`, Buffer.from(JSON.stringify({sequence: lastSequence})));
+    }
+    const state = await readRemoteJson(folder, `${relay.session}/state.json`, {state: 'starting'});
+    const remaining = Math.max(0, names.length - buffers.length);
+    const done = state.state === 'exited' && remaining === 0;
+    if (done) activeTcpRelays.delete(request.relay_id);
+    return {data_base64: Buffer.concat(buffers).toString('base64'), bytes: total, state, done};
+  }
+
+  async function closeTcpRelay(request) {
+    const relay = requireTcpRelay(request);
+    await remoteAtomic(folder, `${relay.session}/close`, Buffer.from('close\n'));
+    await delay(100);
+    relay.execution.terminate();
+    activeTcpRelays.delete(request.relay_id);
+    return {closed: true};
+  }
+
   async function handle(request) {
     if (!request || request.protocol !== PROTOCOL_VERSION) {
       throw new Error(`Unsupported protocol version; expected ${PROTOCOL_VERSION}`);
     }
+    if (stopped || !vscode.workspace.isTrusted) throw new Error('The local bridge requires a trusted, running workspace');
     switch (request.op) {
       case 'status':
-        return statusValue(true);
+        await remoteHealth.check();
+        return statusValue();
       case 'exec':
         return executeCommand(request);
       case 'read': {
@@ -460,13 +624,36 @@ async function activate(context) {
       case 'session.resize': return sessionResize(request);
       case 'session.poll': return sessionPoll(request);
       case 'session.close': return closeSession(request);
+      case 'tcp.start': return startTcpRelay(request);
+      case 'tcp.input': return tcpInput(request);
+      case 'tcp.poll': return tcpPoll(request);
+      case 'tcp.close': return closeTcpRelay(request);
+      case 'tcp.stream.endpoint': {
+        try {
+          if (!streamEndpointLookup) {
+            const current = {};
+            const native = Promise.resolve().then(() => vscode.commands.executeCommand('tunnelterm.streamEndpoint', {mapping_timeout_ms: 3000}));
+            let timer;
+            current.bounded = Promise.race([native, new Promise((_, reject) => {
+              timer = setTimeout(() => reject(Object.assign(new Error('Mapping deadline exceeded'), {code: 'MAPPING_TIMEOUT'})), 4000);
+            })]).finally(() => clearTimeout(timer));
+            void native.then(() => {if (streamEndpointLookup === current) streamEndpointLookup = undefined;},
+              () => {if (streamEndpointLookup === current) streamEndpointLookup = undefined;});
+            streamEndpointLookup = current;
+          }
+          return await streamEndpointLookup.bounded;
+        } catch (error) {
+          throw streamEndpointError(error);
+        }
+      }
       default: throw new Error(`Unsupported operation: ${String(request.op)}`);
     }
   }
 
   async function processClaimedRequest(processingFile, output) {
+    let request;
     try {
-      const request = JSON.parse(await fs.readFile(processingFile, 'utf8'));
+      request = JSON.parse(await fs.readFile(processingFile, 'utf8'));
       // Re-read the credential to tolerate two VS Code windows racing to
       // initialize the same endpoint directory during process startup.
       const currentToken = (await fs.readFile(tokenFile, 'utf8')).trim();
@@ -474,14 +661,15 @@ async function activate(context) {
       if (!/^[0-9a-f-]{36}$/.test(request.id)) throw new Error('Invalid request id');
       await atomicLocal(output, {ok: true, protocol: PROTOCOL_VERSION, ...(await handle(request))});
     } catch (error) {
-      await atomicLocal(output, {ok: false, protocol: PROTOCOL_VERSION, error: String(error?.message || error)});
+      const diagnostic = request?.op === 'tcp.stream.endpoint' ? publicStreamEndpointFailure(error) : {};
+      await atomicLocal(output, {ok: false, protocol: PROTOCOL_VERSION, error: String(error?.message || error), ...diagnostic});
     } finally {
       await fs.unlink(processingFile).catch(() => {});
     }
   }
 
   async function processQueue() {
-    if (processing || stopped) return;
+    if (processing || stopped || !vscode.workspace.isTrusted) return;
     processing = true;
     try {
       const names = (await fs.readdir(queueDirectory))
@@ -501,24 +689,23 @@ async function activate(context) {
           .finally(() => inFlightRequests.delete(requestPromise));
         inFlightRequests.add(requestPromise);
       }
-    } catch (error) {
-      await publishStatus(false, String(error?.message || error)).catch(() => {});
+      localQueueFailed = false;
+    } catch {
+      localQueueFailed = true;
+      await publishStatus().catch(() => {});
     } finally {
       processing = false;
     }
   }
 
-  const queueTimer = setInterval(() => void processQueue(), pollMilliseconds);
-  const heartbeatTimer = setInterval(() => void publishStatus(true).catch(() => {}), 5000);
-  context.subscriptions.push({
-    dispose() {
-      stopped = true;
-      clearInterval(queueTimer);
-      clearInterval(heartbeatTimer);
-      for (const {execution} of activeSessions.values()) execution.terminate();
-      void publishStatus(false, 'VS Code window closed or extension stopped').catch(() => {});
-    },
-  });
+  queueTimer = setInterval(() => void processQueue(), pollMilliseconds);
+  heartbeatTimer = setInterval(() => {
+    if (stopped || heartbeatWork) return;
+    const current = remoteHealth.check().then(publishStatus);
+    heartbeatWork = current;
+    void current.catch(() => {}).finally(() => {if (heartbeatWork === current) heartbeatWork = undefined;});
+    return current;
+  }, 5000);
 }
 
 exports.activate = activate;

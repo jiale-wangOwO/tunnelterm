@@ -6,6 +6,8 @@ import path from 'node:path';
 import {fileURLToPath} from 'node:url';
 import {spawn, spawnSync} from 'node:child_process';
 import {randomUUID} from 'node:crypto';
+import {startStreamForward, relayStream} from '../src/ssh-stream.mjs';
+import {createDevTunnelGateway} from '../src/devtunnel-client.mjs';
 import {
   atomicWrite,
   encodeRemoteUri,
@@ -17,7 +19,7 @@ import {
   takeOption,
 } from '../src/client-core.mjs';
 
-const VERSION = '0.1.1';
+const VERSION = '0.1.3';
 const HELP = `TunnelTerm ${VERSION}
 
 Use an authenticated VS Code Remote Tunnel like a local terminal.
@@ -29,8 +31,13 @@ Usage:
   tunnelterm exec [-t TARGET] [--cwd REMOTE_PATH] [--timeout SECONDS] [--] COMMAND
   tunnelterm get  [-t TARGET] REMOTE_PATH LOCAL_PATH
   tunnelterm put  [-t TARGET] LOCAL_PATH REMOTE_PATH
+  tunnelterm proxy [-t TARGET]
+  tunnelterm forward [-t TARGET] [--port LOCAL_PORT]
+  tunnelterm service start|status|recover|restart|check|refresh|drain|stop --profile NAME [-t WORKSPACE] [--port PORT]
+  tunnelterm service start|restart --profile NAME --direct [--wait-ms MILLISECONDS]
   tunnelterm open TUNNEL REMOTE_PATH [--code PATH] [--dev]
   tunnelterm doctor [--code PATH]
+  tunnelterm mcp
 
 TARGET is a tunnel name, an instance id, or a unique workspace-path substring
 from 'tunnelterm list'. If exactly one bridge is active, -t is optional. In an
@@ -225,6 +232,95 @@ async function putCommand(args) {
   console.error(`Uploaded ${result.bytes} bytes to ${remotePath}`);
 }
 
+async function bridgeTcp(instance, input, output, closeTransport = () => {}, closeOnInputEnd = true) {
+  const started = await sendRequest(instance, {op: 'tcp.start', host: '127.0.0.1', port: 22}, 60_000);
+  const relayId = started.relay_id;
+  let closed = false;
+  const close = async () => {
+    if (closed) return;
+    closed = true;
+    await sendRequest(instance, {op: 'tcp.close', relay_id: relayId}, 5_000).catch(() => {});
+  };
+  let inputFailure = null;
+  const inputPump = (async () => {
+    try {
+      for await (const packet of input) {
+        for (let offset = 0; offset < packet.length; offset += 64 * 1024) {
+          await sendRequest(instance, {
+            op: 'tcp.input', relay_id: relayId,
+            data_base64: packet.subarray(offset, offset + 64 * 1024).toString('base64'),
+          }, 45_000);
+        }
+      }
+    } finally {
+      if (closeOnInputEnd) await close();
+    }
+  })().catch(error => {
+    // A client is allowed to reset its local half of the connection (OpenSSH
+    // does this while probing transports).  Keep the listener alive and let
+    // this bridge clean up only its own remote relay.
+    inputFailure = error;
+    closeTransport();
+  });
+  try {
+    while (!closed && !inputFailure) {
+      const result = await sendRequest(instance, {op: 'tcp.poll', relay_id: relayId}, 15_000);
+      if (result.data_base64) output.write(Buffer.from(result.data_base64, 'base64'));
+      if (result.done) {
+        closeTransport();
+        break;
+      }
+      if (!result.bytes) await new Promise(resolve => setTimeout(resolve, 10));
+    }
+    await inputPump;
+  } finally {
+    await close();
+  }
+}
+
+async function proxyCommand(args) {
+  const legacy = takeFlag(args, '--legacy-files');
+  const instance = await instancesAndTarget(args);
+  if (args.length) throw new Error(`Unexpected proxy arguments: ${args.join(' ')}`);
+  const signalHandler = () => process.stdin.destroy();
+  process.once('SIGHUP', signalHandler);
+  process.once('SIGTERM', signalHandler);
+  try {
+    if (legacy) await bridgeTcp(instance, process.stdin, process.stdout, () => process.stdin.destroy());
+    else {
+      if (instance.capabilities?.ssh_stream !== 1) throw new Error('Reload the updated TunnelTerm UI extension and install its SSH Stream companion first');
+      const gateway = createDevTunnelGateway();
+      try {
+        const endpoint = await sendRequest(instance, {op: 'tcp.stream.endpoint'}, 5000);
+        await relayStream(await gateway.resolve({...endpoint, tunnel: instance.tunnel}, 30_000), process.stdin, process.stdout);
+      } finally {await gateway.close();}
+    }
+  } finally {
+    process.off('SIGHUP', signalHandler);
+    process.off('SIGTERM', signalHandler);
+  }
+}
+
+async function forwardCommand(args) {
+  const traced = takeFlag(args, '--trace');
+  const portValue = takeOption(args, '--port', '-p') || '22222';
+  const port = Number(portValue);
+  if (!Number.isInteger(port) || port < 1024 || port > 65535) {
+    throw new Error('--port must be an integer from 1024 to 65535');
+  }
+  const target = takeOption(args, '--target', '-t');
+  if (args.length) throw new Error(`Unexpected forward arguments: ${args.join(' ')}`);
+  const forward = await startStreamForward({target, port,
+    log: message => process.stderr.write(`TunnelTerm SSH forward connection failed: ${message}\n`),
+    trace: traced ? entry => process.stderr.write(`${JSON.stringify(entry)}\n`) : undefined});
+  process.stderr.write(`TunnelTerm streaming SSH forward listening on 127.0.0.1:${port} for ${forward.workspace}.\n`);
+  const stop = () => {void forward.close();};
+  process.once('SIGHUP', stop);
+  process.once('SIGTERM', stop);
+  process.once('SIGINT', stop);
+  await new Promise(resolve => forward.server.once('close', resolve));
+}
+
 function resolveCodeExecutable(requested) {
   if (process.platform !== 'win32') return requested;
   const candidates = [];
@@ -385,8 +481,20 @@ async function main() {
     case 'exec': await execCommand(args); break;
     case 'get': await getCommand(args); break;
     case 'put': await putCommand(args); break;
+    case 'proxy': await proxyCommand(args); break;
+    case 'forward': await forwardCommand(args); break;
+    case 'service': {
+      const {serviceCommand} = await import('../src/service-cli.mjs');
+      await serviceCommand(args); break;
+    }
     case 'open': await openCommand(args); break;
     case 'doctor': await doctorCommand(args); break;
+    case 'mcp': {
+      if (args.length) throw new Error('mcp accepts no arguments; configure TUNNELTERM_TARGET or TUNNELTERM_HOME in the server environment');
+      const {runMcpServer} = await import('../src/mcp-server.mjs');
+      await runMcpServer();
+      break;
+    }
     default: throw new Error(`Unknown command: ${command}\n\n${HELP}`);
   }
 }

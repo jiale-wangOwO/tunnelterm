@@ -2,6 +2,7 @@ import fs from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import {randomUUID} from 'node:crypto';
+import {publicStreamEndpointFailure} from './bridge-health.cjs';
 
 export const PROTOCOL_VERSION = 1;
 
@@ -58,8 +59,12 @@ export function selectInstance(instances, target) {
     if (!active.length) throw new Error('No active TunnelTerm bridge. Open a trusted VS Code Remote Tunnel workspace first.');
     throw new Error(`More than one bridge is active (${active.map(item => item.tunnel).join(', ')}). Use --target <tunnel-or-instance>.`);
   }
+  const exactWorkspace = instance => {
+    if (instance.workspace === target) return true;
+    try {return decodeURIComponent(new URL(instance.workspace).pathname) === target;} catch {return false;}
+  };
   const exact = active.filter(instance =>
-    instance.instance === target || instance.tunnel === target || instance.authority === target);
+    instance.instance === target || instance.tunnel === target || instance.authority === target || exactWorkspace(instance));
   if (exact.length === 1) return exact[0];
   if (exact.length > 1) {
     throw new Error(`Target ${target} matches multiple windows. Use an instance id from 'tunnelterm list'.`);
@@ -87,7 +92,15 @@ export async function sendRequest(instance, body, timeoutMilliseconds = 30_000) 
     try {
       const result = JSON.parse(await fs.readFile(responseFile, 'utf8'));
       await fs.unlink(responseFile).catch(() => {});
-      if (!result.ok) throw new Error(result.error || 'Bridge request failed');
+      if (!result.ok) {
+        // Only this read-only operation defines typed endpoint diagnostics.
+        // Reconstruct canonical values; never trust remote text/actions or
+        // forward arbitrary error properties into callers and service logs.
+        const diagnostic = body?.op === 'tcp.stream.endpoint' ? publicStreamEndpointFailure(result) : {};
+        const error = new Error(diagnostic.error || result.error || 'Bridge request failed');
+        if (diagnostic.code) Object.assign(error, {code: diagnostic.code, next_action: diagnostic.next_action});
+        throw error;
+      }
       return result;
     } catch (error) {
       if (error.code !== 'ENOENT' && !(error instanceof SyntaxError)) throw error;

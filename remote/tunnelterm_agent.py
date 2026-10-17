@@ -18,6 +18,7 @@ import pty
 import select
 import shlex
 import signal
+import socket
 import struct
 import subprocess
 import sys
@@ -268,6 +269,99 @@ def run_session(session: Path, cwd: str, configured_shell: str, cols: int, rows:
                 kill_process_group(process, signal.SIGKILL)
 
 
+def run_tcp(session: Path, host: str, port: int) -> int:
+    """Relay a single, loopback-only TCP connection through file packets."""
+    if host not in {"127.0.0.1", "::1"} or port != 22:
+        raise RuntimeError("TunnelTerm TCP relay only permits loopback SSH on port 22")
+
+    inbox = session / "in"
+    outbox = session / "out"
+    inbox.mkdir(parents=True, exist_ok=True, mode=0o700)
+    outbox.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        session.chmod(0o700)
+        inbox.chmod(0o700)
+        outbox.chmod(0o700)
+    except OSError:
+        pass
+
+    connection = socket.create_connection((host, port), timeout=10)
+    connection.setblocking(False)
+    output_sequence = 0
+    last_ack = -1
+    last_input_sequence = -1
+    pending_sequence: int | None = None
+    pending = memoryview(b"")
+    closing = False
+    atomic_json(session / "state.json", {"state": "running", "host": host, "port": port, "started": time.time()})
+
+    def close_connection(_signum: int | None = None, _frame: object = None) -> None:
+        nonlocal closing
+        if not closing:
+            closing = True
+            try:
+                connection.shutdown(socket.SHUT_WR)
+            except OSError:
+                pass
+
+    signal.signal(signal.SIGTERM, close_connection)
+    signal.signal(signal.SIGINT, close_connection)
+    try:
+        while True:
+            if (session / "close").exists():
+                close_connection()
+
+            if pending_sequence is None:
+                for item in sorted(inbox.glob("*.bin")):
+                    try:
+                        sequence = int(item.stem)
+                        if sequence > last_input_sequence:
+                            pending_sequence = sequence
+                            pending = memoryview(item.read_bytes())
+                            break
+                    except (FileNotFoundError, ValueError):
+                        continue
+
+            ack_value = read_json(session / "ack.json", {})
+            if isinstance(ack_value, dict):
+                try:
+                    last_ack = max(last_ack, int(ack_value.get("sequence", -1)))
+                except (TypeError, ValueError):
+                    pass
+
+            readable = output_sequence - last_ack <= MAX_UNACKED_CHUNKS
+            read_ready, write_ready, _ = select.select(
+                [connection] if readable else [],
+                [connection] if pending else [],
+                [],
+                0.02,
+            )
+            if write_ready:
+                try:
+                    sent = connection.send(pending)
+                    pending = pending[sent:]
+                    if not pending:
+                        last_input_sequence = pending_sequence if pending_sequence is not None else last_input_sequence
+                        atomic_json(session / "input_ack.json", {"sequence": last_input_sequence})
+                        pending_sequence = None
+                except BlockingIOError:
+                    pass
+
+            if read_ready:
+                data = connection.recv(CHUNK_BYTES)
+                if data:
+                    atomic_bytes(outbox / f"{output_sequence:016d}.bin", data)
+                    output_sequence += 1
+                else:
+                    atomic_json(session / "state.json", {"state": "exited", "ended": time.time(), "last_output_sequence": output_sequence - 1})
+                    return 0
+    except OSError as exc:
+        atomic_json(session / "state.json", {"state": "exited", "ended": time.time(), "error": str(exc), "last_output_sequence": output_sequence - 1})
+        return 1
+    finally:
+        connection.close()
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="TunnelTerm remote helper")
     subparsers = parser.add_subparsers(dest="mode", required=True)
@@ -279,6 +373,10 @@ def parse_args() -> argparse.Namespace:
     session_parser.add_argument("--shell", default="")
     session_parser.add_argument("--cols", type=int, default=80)
     session_parser.add_argument("--rows", type=int, default=24)
+    tcp_parser = subparsers.add_parser("tcp")
+    tcp_parser.add_argument("session", type=Path)
+    tcp_parser.add_argument("--host", required=True)
+    tcp_parser.add_argument("--port", type=int, required=True)
     return parser.parse_args()
 
 
@@ -286,7 +384,9 @@ def main() -> int:
     args = parse_args()
     if args.mode == "exec":
         return run_exec(args.job)
-    return run_session(args.session, args.cwd, args.shell, args.cols, args.rows)
+    if args.mode == "session":
+        return run_session(args.session, args.cwd, args.shell, args.cols, args.rows)
+    return run_tcp(args.session, args.host, args.port)
 
 
 if __name__ == "__main__":
