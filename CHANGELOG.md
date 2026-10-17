@@ -4,6 +4,9 @@
 
 ### Health, recovery and publication hygiene
 
+- Keep POSIX lifecycle sockets below the macOS byte limit, using an
+  owner-verified private short-path directory for deeply nested state homes;
+  cover restart from long paths in the real local-daemon regression.
 - Distinguish local UI heartbeat from real remote-provider readiness with bounded,
   single-flight probes, typed safe endpoint diagnostics and stale-result fencing.
 - Add profile-based `service recover` and lease-protected `service restart`, with

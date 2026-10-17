@@ -7,6 +7,11 @@ service lifecycle. Both use ordinary SSH and normal host-key verification.
 ## Contract
 
 - One loopback listener and persisted profile, independent of backend ports.
+- Local lifecycle control uses authenticated Windows named pipes or POSIX
+  sockets. If the state path exceeds the POSIX socket-name byte budget, only
+  the socket moves into `/tmp/tunnelterm-<uid>` (verified user ownership, mode
+  `0700`, no symlink); configuration and private runtime state stay in the
+  selected service home. No live service is migrated automatically.
 - Health means a **new** connection reaches an SSH-2.0 banner through the
   capability-authenticated broker. It does not claim user-key authentication;
   real ordinary OpenSSH regression separately checks that.

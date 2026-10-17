@@ -116,10 +116,26 @@ const directory = () => process.env.TUNNELTERM_SERVICE_HOME ? path.resolve(proce
   process.platform === 'win32' && !process.env.TUNNELTERM_HOME ? path.join(os.homedir(), '.tunnelterm', 'services') : path.join(stateRoot(), 'services');
 const filesFor = profile => ({config: path.join(directory(), `${profile}.json`), runtime: path.join(directory(), `${profile}.runtime.json`),
   route: path.join(directory(), `${profile}.route.json`), log: path.join(directory(), `${profile}.log`)});
-const socketFor = profile => {
-  const namespace = createHash('sha256').update(`${path.resolve(directory()).toLowerCase()}|${profile.toLowerCase()}`).digest('hex').slice(0, 32);
-  return process.platform === 'win32' ? `\\\\.\\pipe\\tunnelterm-${namespace}` : path.join(directory(), `control-${namespace}.sock`);
-};
+export function serviceControlSocket(serviceDirectory, profile, {platform = process.platform, uid = process.getuid?.()} = {}) {
+  const resolved = platform === 'win32' ? path.win32.resolve(serviceDirectory).toLowerCase() : path.posix.resolve(serviceDirectory);
+  const namespace = createHash('sha256').update(`${resolved}|${profile.toLowerCase()}`).digest('hex').slice(0, 32);
+  if (platform === 'win32') return `\\\\.\\pipe\\tunnelterm-${namespace}`;
+  const candidate = path.posix.join(resolved, `control-${namespace}.sock`);
+  // macOS has a 103-byte sockaddr_un limit. Older Node/libuv versions can
+  // truncate longer names, leaving a socket that close() cannot unlink.
+  if (Buffer.byteLength(candidate) <= 103) return candidate;
+  if (!Number.isSafeInteger(uid) || uid < 0) throw new Error('Cannot determine the private IPC directory owner');
+  return `/tmp/tunnelterm-${uid}/control-${namespace}.sock`;
+}
+async function prepareControlDirectory(socketPath) {
+  if (process.platform === 'win32' || path.dirname(socketPath) === path.resolve(directory())) return;
+  const parent = path.dirname(socketPath);
+  await fs.mkdir(parent, {mode: 0o700}).catch(error => {if (error.code !== 'EEXIST') throw error;});
+  const stat = await fs.lstat(parent);
+  if (!stat.isDirectory() || stat.uid !== process.getuid() || (stat.mode & 0o077) !== 0) {
+    throw new Error('Private IPC directory must be owned by this user with mode 0700');
+  }
+}
 async function readJson(file) {try {return JSON.parse((await fs.readFile(file, 'utf8')).replace(/^\uFEFF/, ''));} catch (error) {if (error.code === 'ENOENT') return undefined; throw error;}}
 
 export async function controlService(runtime, action = 'status', timeout = 45000) {
@@ -150,8 +166,9 @@ export async function controlService(runtime, action = 'status', timeout = 45000
 async function run(profile, config, files, bootstrapRoute) {
   const serviceId = randomUUID();
   let service;
-  const socketPath = socketFor(profile);
+  const socketPath = serviceControlSocket(directory(), profile);
   await fs.mkdir(directory(), {recursive: true, mode: 0o700});
+  await prepareControlDirectory(socketPath);
   if (process.platform !== 'win32') {
     // Reclaim only our exact stale IPC socket, and only ECONNREFUSED/ENOENT.
     // A timeout, authenticated error, or a live socket must never be removed.
